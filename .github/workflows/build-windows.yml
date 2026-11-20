@@ -3,15 +3,24 @@ name: Build NCrewsShellExtensions (Windows x64 Release)
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Create a GitHub Release (only effective on tags)'
+        required: false
+        default: 'false'
+        type: boolean
 
 env:
   BUILD_CONFIG: Release
   BUILD_PLATFORM: x64
   VCPKG_ROOT: ${{ github.workspace }}/vcpkg
   THIRDPARTY_ROOT: ${{ github.workspace }}/3rdpartylibs
+  OPEN3D_VERSION: 0.18.0          # matches CloudShellExtension; ModelShellExtension also accepts it
+  OPENCV_VERSION: 4.9.0
 
 jobs:
   build:
@@ -19,103 +28,176 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSVC Developer Command Prompt
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Install CMake and Ninja
+      - name: Install tools (CMake, Ninja, 7zip)
         run: |
-          choco install cmake ninja -y --no-progress
+          choco install cmake ninja 7zip -y --no-progress
           echo "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Cache vcpkg
+      # ---------- Cache ----------
+      - name: Cache vcpkg + 3rd-party
         uses: actions/cache@v4
+        id: cache
         with:
           path: |
             ${{ env.VCPKG_ROOT }}
+            ${{ env.THIRDPARTY_ROOT }}
             ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-${{ runner.os }}-opencv-tinyxml2-v1
+          key: deps-${{ runner.os }}-o3d${{ env.OPEN3D_VERSION }}-ocv${{ env.OPENCV_VERSION }}-v2
           restore-keys: |
-            vcpkg-${{ runner.os }}-
+            deps-${{ runner.os }}-
 
-      - name: Bootstrap vcpkg and install packages
+      # ---------- vcpkg (OpenCV + tinyxml2) ----------
+      - name: Bootstrap vcpkg
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          if (-not (Test-Path "${{ env.VCPKG_ROOT }}")) {
-            git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
-          }
-          Push-Location "${{ env.VCPKG_ROOT }}"
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          Push-Location $env:VCPKG_ROOT
           .\bootstrap-vcpkg.bat -disableMetrics
           .\vcpkg integrate install
-          .\vcpkg install opencv[core,imgproc,imgcodecs,world]:x64-windows tinyxml2:x64-windows --clean-after-build
           Pop-Location
 
-      - name: Create 3rd-party directory structure
+      - name: Install OpenCV + tinyxml2 via vcpkg
         shell: pwsh
         run: |
-          $dirs = @(
-            "${{ env.THIRDPARTY_ROOT }}\Open3D19\install\include",
-            "${{ env.THIRDPARTY_ROOT }}\Open3D19\install\lib",
-            "${{ env.THIRDPARTY_ROOT }}\Open3D19\install\bin",
-            "${{ env.THIRDPARTY_ROOT }}\Open3D19\build\bin\resources",
-            "${{ env.THIRDPARTY_ROOT }}\LAStools\LASlib\inc",
-            "${{ env.THIRDPARTY_ROOT }}\LAStools\LASlib\lib\Release",
-            "${{ env.THIRDPARTY_ROOT }}\opencv\build\include",
-            "${{ env.THIRDPARTY_ROOT }}\opencv\build\x64\vc16\lib",
-            "${{ env.THIRDPARTY_ROOT }}\TinyXML\Inc",
-            "${{ env.THIRDPARTY_ROOT }}\TinyXML\Source"
-          )
-          foreach ($d in $dirs) {
-            New-Item -ItemType Directory -Force -Path $d | Out-Null
-          }
-          Write-Host "3rd-party directory structure created."
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            "opencv[core,imgproc,imgcodecs,world]:x64-windows" `
+            "tinyxml2:x64-windows" `
+            --clean-after-build
 
-      - name: Patch vcxproj files (replace hardcoded paths)
+      # ---------- Open3D (pre-built official release) ----------
+      - name: Download & extract Open3D
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ver = $env:OPEN3D_VERSION
+          $url = "https://github.com/isl-org/Open3D/releases/download/v$ver/open3d-devel-windows-amd64-$ver.zip"
+          $zip = "$env:RUNNER_TEMP\open3d.zip"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          $dest = "$env:THIRDPARTY_ROOT\Open3D"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          # Normalise layout so both Open3D18 / Open3D19 style paths work
+          $extracted = Get-ChildItem $dest -Directory | Select-Object -First 1
+          if ($extracted) {
+            # Create the aliases the vcxproj files expect
+            New-Item -ItemType Junction -Path "$env:THIRDPARTY_ROOT\Open3D19\install" -Target $extracted.FullName -Force | Out-Null
+            New-Item -ItemType Junction -Path "$env:THIRDPARTY_ROOT\Open3D18" -Target $extracted.FullName -Force | Out-Null
+            # resources folder expected by post-build
+            $resSrc = Join-Path $extracted.FullName "bin\resources"
+            if (Test-Path $resSrc) {
+              New-Item -ItemType Directory -Force -Path "$env:THIRDPARTY_ROOT\Open3D19\build\bin\resources" | Out-Null
+              Copy-Item "$resSrc\*" "$env:THIRDPARTY_ROOT\Open3D19\build\bin\resources\" -Recurse -Force
+            }
+          }
+          Write-Host "Open3D layout ready"
+
+      # ---------- LASLib (build from source – small) ----------
+      - name: Build LASLib
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $lasRoot = "$env:THIRDPARTY_ROOT\LAStools"
+          if (-not (Test-Path $lasRoot)) {
+            git clone --depth 1 --branch "v2.0.3" https://github.com/LAStools/LAStools.git $lasRoot
+          }
+          # LASlib is a simple static lib; build the Release x64 target
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          # LASlib has its own VS project under LASlib
+          $sln = Get-ChildItem "$lasRoot\LASlib" -Filter "*.sln" -Recurse | Select-Object -First 1
+          if ($sln) {
+            & $msbuild $sln.FullName /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+          } else {
+            # Fallback: compile the few source files ourselves if needed
+            Write-Warning "No .sln found – LASlib may need manual compile"
+          }
+          # Create expected layout
+          New-Item -ItemType Directory -Force -Path "$lasRoot\LASlib\lib\Release" | Out-Null
+          Get-ChildItem "$lasRoot" -Recurse -Filter "laslib.lib" | Copy-Item -Destination "$lasRoot\LASlib\lib\Release\" -Force
+
+      # ---------- TinyXML layout (source is referenced outside the repo) ----------
+      - name: Prepare TinyXML
+        shell: pwsh
+        run: |
+          $tiny = "$env:THIRDPARTY_ROOT\TinyXML"
+          New-Item -ItemType Directory -Force -Path "$tiny\Inc","$tiny\Source" | Out-Null
+          # Prefer vcpkg headers + sources if available, otherwise download
+          $vcpkgInc = "$env:VCPKG_ROOT\installed\x64-windows\include"
+          if (Test-Path "$vcpkgInc\tinyxml2.h") {
+            Copy-Item "$vcpkgInc\tinyxml2.h" "$tiny\Inc\" -Force
+          }
+          # Download official tinyxml2 source if missing
+          if (-not (Test-Path "$tiny\Source\tinyxml2.cpp")) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/leethomason/tinyxml2/master/tinyxml2.cpp" `
+              -OutFile "$tiny\Source\tinyxml2.cpp" -UseBasicParsing
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/leethomason/tinyxml2/master/tinyxml2.h" `
+              -OutFile "$tiny\Inc\tinyxml2.h" -UseBasicParsing
+          }
+
+      # ---------- Symlink / copy OpenCV into expected layout ----------
+      - name: Layout OpenCV
+        shell: pwsh
+        run: |
+          $vcpkg = "$env:VCPKG_ROOT\installed\x64-windows"
+          $ocv = "$env:THIRDPARTY_ROOT\opencv\build"
+          New-Item -ItemType Directory -Force -Path "$ocv\include","$ocv\x64\vc16\lib","$ocv\x64\vc16\bin" | Out-Null
+          Copy-Item "$vcpkg\include\opencv2" "$ocv\include\" -Recurse -Force
+          # world library
+          Get-ChildItem "$vcpkg\lib" -Filter "opencv_world*.lib" | Copy-Item -Destination "$ocv\x64\vc16\lib\" -Force
+          Get-ChildItem "$vcpkg\bin" -Filter "opencv_world*.dll" | Copy-Item -Destination "$ocv\x64\vc16\bin\" -Force
+          # also create the exact name the vcxproj expects
+          $lib = Get-ChildItem "$ocv\x64\vc16\lib" -Filter "opencv_world*.lib" | Select-Object -First 1
+          if ($lib) { Copy-Item $lib.FullName "$ocv\x64\vc16\lib\opencv_world490.lib" -Force }
+
+      # ---------- Patch vcxproj files ----------
+      - name: Patch hardcoded paths in vcxproj
         shell: pwsh
         run: |
           $files = @(
             "build\ModelShellExtension.vcxproj",
             "build\CloudShellExtension.vcxproj"
           )
+          $tp = $env:THIRDPARTY_ROOT -replace '\\','\\'
+          $vp = $env:VCPKG_ROOT -replace '\\','\\'
 
-          foreach ($file in $files) {
-            if (-not (Test-Path $file)) {
-              Write-Warning "File not found: $file"
-              continue
-            }
-
-            $content = Get-Content -Path $file -Raw
-
-            # Replace author's hardcoded paths
-            $content = $content -replace 'D:\\3rdpartylibs\\Open3D19', '${{ env.THIRDPARTY_ROOT }}\Open3D19'
-            $content = $content -replace 'D:/3rdpartylibs/Open3D19', '${{ env.THIRDPARTY_ROOT }}/Open3D19'
-            $content = $content -replace 'D:\\3rdpartylibs\\Open3D18', '${{ env.THIRDPARTY_ROOT }}\Open3D19'
-            $content = $content -replace 'D:/3rdpartylibs/Open3D18', '${{ env.THIRDPARTY_ROOT }}/Open3D19'
-            $content = $content -replace 'D:\\3rdpartylibs\\LAStools-2.0.3', '${{ env.THIRDPARTY_ROOT }}\LAStools'
-            $content = $content -replace 'D:\\3rdpartylibs\\opencv', '${{ env.THIRDPARTY_ROOT }}\opencv'
-            $content = $content -replace 'D:\\3rdpartylibs\\TinyXML', '${{ env.THIRDPARTY_ROOT }}\TinyXML'
-            $content = $content -replace 'D:\\github\\vcpkg', '${{ env.VCPKG_ROOT }}'
-
-            Set-Content -Path $file -Value $content -NoNewline
-            Write-Host "Patched: $file"
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { continue }
+            $c = Get-Content $f -Raw
+            $c = $c -replace 'D:\\3rdpartylibs\\Open3D19', $tp + '\\Open3D19'
+            $c = $c -replace 'D:/3rdpartylibs/Open3D19',  ($tp -replace '\\','/') + '/Open3D19'
+            $c = $c -replace 'D:\\3rdpartylibs\\Open3D18', $tp + '\\Open3D18'
+            $c = $c -replace 'D:/3rdpartylibs/Open3D18',  ($tp -replace '\\','/') + '/Open3D18'
+            $c = $c -replace 'D:\\3rdpartylibs\\LAStools-2\.0\.3', $tp + '\\LAStools'
+            $c = $c -replace 'D:\\3rdpartylibs\\opencv', $tp + '\\opencv'
+            $c = $c -replace 'D:\\3rdpartylibs\\TinyXML', $tp + '\\TinyXML'
+            $c = $c -replace 'D:\\github\\vcpkg', $vp
+            $c = $c -replace '\.\.\\\.\.\\\.\.\\3rdpartylibs\\TinyXML', $tp + '\\TinyXML'
+            Set-Content $f $c -NoNewline
+            Write-Host "Patched $f"
           }
 
+      # ---------- Locate MSBuild ----------
       - name: Locate MSBuild
         id: msbuild
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-          if (-not $msbuild) {
-            throw "MSBuild not found"
-          }
-          echo "MSBUILD_PATH=$msbuild" >> $env:GITHUB_OUTPUT
-          Write-Host "Using MSBuild: $msbuild"
+          if (-not $msbuild) { throw "MSBuild not found" }
+          "MSBUILD_PATH=$msbuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "MSBuild: $msbuild"
 
+      # ---------- Build C++ shell extensions ----------
       - name: Build ModelShellExtension
         shell: pwsh
         run: |
@@ -125,7 +207,6 @@ jobs:
             /p:Platform=${{ env.BUILD_PLATFORM }} `
             /p:PlatformToolset=v143 `
             /m /v:minimal /nologo
-        continue-on-error: true
 
       - name: Build CloudShellExtension
         shell: pwsh
@@ -136,32 +217,113 @@ jobs:
             /p:Platform=${{ env.BUILD_PLATFORM }} `
             /p:PlatformToolset=v143 `
             /m /v:minimal /nologo
-        continue-on-error: true
 
-      - name: Collect artifacts
+      # ---------- Build C# Options apps (optional but useful) ----------
+      - name: Restore & build Options projects
         shell: pwsh
         run: |
-          $out = "artifacts"
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          # NuGet packages are referenced from build\packages – restore if present
+          if (Test-Path "build\packages") {
+            nuget restore CloudExtensionOptions\CloudExtensionOptions.csproj -PackagesDirectory build\packages -NonInteractive
+          }
+          & "${{ steps.msbuild.outputs.MSBUILD_PATH }}" `
+            "CloudExtensionOptions\CloudExtensionOptions.csproj" `
+            /p:Configuration=Release /p:Platform=AnyCPU /m /v:minimal
+          & "${{ steps.msbuild.outputs.MSBUILD_PATH }}" `
+            "GLTFExtensionOptions\GLTFExtensionOptions.csproj" `
+            /p:Configuration=Release /p:Platform=AnyCPU /m /v:minimal
+        continue-on-error: true   # non-fatal if packages missing
 
-          Get-ChildItem -Path "build" -Recurse -Include "*.dll","*.pdb" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "Release|x64" } |
-            ForEach-Object {
-              Copy-Item $_.FullName -Destination $out -Force
-              Write-Host "Collected: $($_.Name)"
+      # ---------- Stage dist/ ----------
+      - name: Assemble dist folder
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          # Compiled binaries
+          $binPatterns = @(
+            "build\Release\**\*.dll",
+            "build\Release\**\*.exe",
+            "build\Release\ModelShellExtension\*.dll",
+            "CloudExtensionOptions\bin\Release\*.exe",
+            "GLTFExtensionOptions\bin\Release\*.exe"
+          )
+          foreach ($p in $binPatterns) {
+            Get-ChildItem -Path $p -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName $dist -Force
+              Write-Host "Copied $($_.Name)"
             }
-
-          $count = (Get-ChildItem $out -ErrorAction SilentlyContinue | Measure-Object).Count
-          if ($count -eq 0) {
-            Write-Warning "No DLLs found. Build failed due to missing Open3D / LASLib binaries."
-          } else {
-            Write-Host "Collected $count file(s)."
           }
 
-      - name: Upload artifacts
+          # Runtime dependency DLLs
+          $depDirs = @(
+            "$env:THIRDPARTY_ROOT\Open3D19\install\bin",
+            "$env:THIRDPARTY_ROOT\Open3D18\bin",
+            "$env:THIRDPARTY_ROOT\opencv\build\x64\vc16\bin",
+            "$env:VCPKG_ROOT\installed\x64-windows\bin"
+          )
+          foreach ($d in $depDirs) {
+            if (Test-Path $d) {
+              Get-ChildItem $d -Filter "*.dll" | Copy-Item -Destination $dist -Force
+            }
+          }
+
+          # Open3D resources (required at runtime)
+          $res = "$env:THIRDPARTY_ROOT\Open3D19\build\bin\resources"
+          if (Test-Path $res) {
+            New-Item -ItemType Directory -Force -Path "$dist\resources" | Out-Null
+            Copy-Item "$res\*" "$dist\resources\" -Recurse -Force
+          }
+
+          # Helper / registration scripts
+          $scripts = @(
+            "Register-Win11-Extensions.ps1",
+            "Register-Win11-PointCloud.ps1",
+            "Clear_and_Reset_Thumbnail_Cache.bat",
+            "re-explorer.bat"
+          )
+          foreach ($s in $scripts) {
+            if (Test-Path $s) { Copy-Item $s $dist -Force }
+          }
+
+          # README for the artifact
+          @"
+          NCrewsShellExtensions – Windows x64 Release build
+          =================================================
+          Contents:
+            - ModelShellExtension.dll / CloudShellExtension.dll
+            - Options executables (if built)
+            - Open3D / OpenCV / TBB / etc. runtime DLLs
+            - resources/ (Open3D shader/font assets)
+            - Registration scripts
+
+          To install on a test machine:
+            1. Copy the whole folder somewhere permanent
+            2. Run Register-Win11-Extensions.ps1 as Administrator
+            3. (Optional) Clear_and_Reset_Thumbnail_Cache.bat
+          "@ | Set-Content "$dist\README-ARTIFACT.txt"
+
+          Write-Host "=== dist contents ==="
+          Get-ChildItem $dist -Recurse | Select-Object FullName
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NCrewsShellExtensions-x64-Release
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 14
+          name: NCrewsShellExtensions-win64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------- GitHub Release on tags ----------
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
